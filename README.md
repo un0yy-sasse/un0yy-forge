@@ -5,7 +5,6 @@
 **Where all my finished projects, scripts, documents & creations live.**
 
 ![Status](https://img.shields.io/badge/status-active-brightgreen?style=for-the-badge)
-![Made with Claude](https://img.shields.io/badge/made%20with-Claude-d97757?style=for-the-badge)
 ![Owner](https://img.shields.io/badge/owner-un0yy-6f42c1?style=for-the-badge)
 
 </div>
