@@ -2,7 +2,7 @@
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $csc  = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-$src  = Join-Path $root 'src\Program.cs'
+$src  = Join-Path $root 'src\*.cs'
 $out  = Join-Path $root 'dist'
 $ico  = Join-Path $root 'build\icon.ico'
 New-Item -ItemType Directory -Force $out, (Join-Path $root 'build') | Out-Null
