@@ -1,4 +1,4 @@
-# Builds un0yy-vault.exe with the C# compiler that ships with Windows (.NET Framework 4.8).
+﻿# Builds un0yy-vault.exe with the C# compiler that ships with Windows (.NET Framework 4.8).
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $csc  = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
@@ -7,7 +7,7 @@ $out  = Join-Path $root 'dist'
 $ico  = Join-Path $root 'build\icon.ico'
 New-Item -ItemType Directory -Force $out, (Join-Path $root 'build') | Out-Null
 
-$refs = '/r:System.dll', '/r:System.Core.dll', '/r:System.Drawing.dll', '/r:System.Windows.Forms.dll'
+$refs = '/r:System.dll', '/r:System.Core.dll', '/r:System.Drawing.dll', '/r:System.Windows.Forms.dll', '/r:System.IO.Compression.dll', '/r:System.IO.Compression.FileSystem.dll'
 
 # 1) bootstrap build (no icon) -> generates the icon
 $boot = Join-Path $root 'build\bootstrap.exe'
