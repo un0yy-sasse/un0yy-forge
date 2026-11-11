@@ -1,31 +1,22 @@
-﻿// un0yy Vault v1.0.1 - password protected, AES-256 encrypted file vault.
+﻿// un0yy Vault v2.0.0 - password protected, AES-256 encrypted file vault.
 // Build: see build.ps1 (uses the C# compiler that ships with Windows / .NET Framework 4.8)
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
-using System.Drawing;
-using System.Drawing.Drawing2D;
-using System.Drawing.Imaging;
 using System.IO;
-using System.Linq;
 using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
-using System.Windows.Forms;
 
 [assembly: AssemblyTitle("un0yy Vault")]
 [assembly: AssemblyProduct("un0yy Vault")]
 [assembly: AssemblyDescription("Password protected, encrypted file vault")]
 [assembly: AssemblyCompany("un0yy")]
 [assembly: AssemblyCopyright("un0yy")]
-[assembly: AssemblyVersion("1.0.1.0")]
-[assembly: AssemblyFileVersion("1.0.1.0")]
+[assembly: AssemblyVersion("2.0.0.0")]
+[assembly: AssemblyFileVersion("2.0.0.0")]
 
 namespace Un0yyVault
 {
-    // ------------------------------------------------------------------ crypto / storage
-
     class VaultEntry
     {
         public string Id;
@@ -34,27 +25,35 @@ namespace Un0yyVault
         public DateTime Added; // UTC
     }
 
+    // On-disk format (unchanged since v1, so old vaults keep working):
+    //   vault.key  = "UN0YYV1" | salt(16) | iterations(int32) | Seal(passwordKey, masterKey64)
+    //   index.dat  = Seal(masterKey, file list)        files/<id>.bin = IV | AES-256-CBC | HMAC-SHA256
+    //   meta.dat   = Seal(masterKey, favourites)       (new in v2, optional)
     class Vault
     {
         static readonly byte[] Magic = Encoding.ASCII.GetBytes("UN0YYV1");
-        const int Iterations = 310000;
+        public const int Iterations = 600000;
 
         public readonly string Dir;
-        readonly string keyPath, indexPath, filesDir;
-        byte[] ek, mk; // AES key, HMAC key (only in memory while unlocked)
+        readonly string keyPath, indexPath, metaPath, filesDir;
+        byte[] ek, mk;
         public List<VaultEntry> Entries = new List<VaultEntry>();
+        public HashSet<string> Favorites = new HashSet<string>();
+        public int KeyIterations;
 
         public Vault(string dir)
         {
             Dir = dir;
             keyPath = Path.Combine(dir, "vault.key");
             indexPath = Path.Combine(dir, "index.dat");
+            metaPath = Path.Combine(dir, "meta.dat");
             filesDir = Path.Combine(dir, "files");
         }
 
         public bool Exists { get { return File.Exists(keyPath); } }
+        public bool IsUnlocked { get { return ek != null; } }
 
-        // ---- helpers
+        // ---------------------------------------------------------------- helpers
         static byte[] Rand(int n)
         {
             byte[] b = new byte[n];
@@ -116,7 +115,6 @@ namespace Un0yyVault
             else File.Move(tmp, path);
         }
 
-        // Encrypt-then-MAC: IV(16) | AES-256-CBC ciphertext | HMAC-SHA256(IV|ciphertext)
         static byte[] Seal(byte[] k64, byte[] plain)
         {
             byte[] e = Part(k64, 0, 32), m = Part(k64, 32, 32);
@@ -147,7 +145,15 @@ namespace Un0yyVault
             }
         }
 
-        byte[] MasterKey { get { return Cat(ek, mk); } }
+        byte[] MasterKey
+        {
+            get
+            {
+                byte[] e = ek, m = mk;
+                if (e == null || m == null) throw new InvalidOperationException("Der Tresor ist gesperrt.");
+                return Cat(e, m);
+            }
+        }
 
         void SetKeys(byte[] master)
         {
@@ -162,6 +168,7 @@ namespace Un0yyVault
             byte[] pk = Derive(pw, salt, Iterations);
             try { WriteAtomic(keyPath, Cat(Magic, salt, BitConverter.GetBytes(Iterations), Seal(pk, master))); }
             finally { Array.Clear(pk, 0, pk.Length); }
+            KeyIterations = Iterations;
         }
 
         byte[] TryOpenMaster(string pw)
@@ -174,12 +181,17 @@ namespace Un0yyVault
             int it = BitConverter.ToInt32(data, o); o += 4;
             if (it < 1000 || it > 50000000) throw new InvalidDataException("Die Datei vault.key ist beschädigt.");
             byte[] pk = Derive(pw, salt, it);
-            try { return Unseal(pk, Part(data, o, data.Length - o)); }
+            try
+            {
+                byte[] m = Unseal(pk, Part(data, o, data.Length - o));
+                KeyIterations = it;
+                return m;
+            }
             catch (CryptographicException) { return null; }
             finally { Array.Clear(pk, 0, pk.Length); }
         }
 
-        // ---- public API
+        // ---------------------------------------------------------------- lifecycle
         public void Create(string pw)
         {
             Directory.CreateDirectory(Dir);
@@ -188,6 +200,7 @@ namespace Un0yyVault
             WriteKeyFile(pw, master);
             SetKeys(master);
             Entries = new List<VaultEntry>();
+            Favorites = new HashSet<string>();
             SaveIndex();
         }
 
@@ -198,8 +211,12 @@ namespace Un0yyVault
             SetKeys(m);
             Directory.CreateDirectory(filesDir);
             LoadIndex();
+            LoadMeta();
             return true;
         }
+
+        /// Re-wraps the master key with the current (stronger) KDF settings. Files are untouched.
+        public bool NeedsKdfUpgrade { get { return KeyIterations < Iterations; } }
 
         public bool ChangePassword(string oldPw, string newPw)
         {
@@ -212,12 +229,15 @@ namespace Un0yyVault
 
         public void Lock()
         {
-            if (ek != null) Array.Clear(ek, 0, ek.Length);
-            if (mk != null) Array.Clear(mk, 0, mk.Length);
+            byte[] e = ek, m = mk;
             ek = null; mk = null;
+            if (e != null) Array.Clear(e, 0, e.Length);
+            if (m != null) Array.Clear(m, 0, m.Length);
             Entries = new List<VaultEntry>();
+            Favorites = new HashSet<string>();
         }
 
+        // ---------------------------------------------------------------- index + meta
         void LoadIndex()
         {
             Entries = new List<VaultEntry>();
@@ -249,9 +269,34 @@ namespace Un0yyVault
             WriteAtomic(indexPath, Seal(MasterKey, Encoding.UTF8.GetBytes(sb.ToString())));
         }
 
+        void LoadMeta()
+        {
+            Favorites = new HashSet<string>();
+            if (!File.Exists(metaPath)) return;
+            try
+            {
+                string text = Encoding.UTF8.GetString(Unseal(MasterKey, File.ReadAllBytes(metaPath)));
+                foreach (string line in text.Split('\n'))
+                {
+                    string[] p = line.Split('\t');
+                    if (p.Length == 2 && p[0] == "FAV") Favorites.Add(p[1]);
+                }
+            }
+            catch (CryptographicException) { /* favourites are optional - ignore a damaged file */ }
+        }
+
+        void SaveMeta()
+        {
+            var sb = new StringBuilder("UN0YYMETA1\n");
+            foreach (var id in Favorites) sb.Append("FAV\t").Append(id).Append('\n');
+            WriteAtomic(metaPath, Seal(MasterKey, Encoding.UTF8.GetBytes(sb.ToString())));
+        }
+
         string BlobPath(string id) { return Path.Combine(filesDir, id + ".bin"); }
 
-        public VaultEntry AddFile(string src, string name)
+        // ---------------------------------------------------------------- file operations
+        /// Encrypts a file into a new blob. Safe to call from a background thread; call Commit() on the UI thread afterwards.
+        public VaultEntry EncryptNew(string src, string name, Action<long> progress)
         {
             var en = new VaultEntry();
             en.Id = Guid.NewGuid().ToString("N");
@@ -259,10 +304,24 @@ namespace Un0yyVault
             en.Size = new FileInfo(src).Length;
             en.Added = DateTime.UtcNow;
             string dst = BlobPath(en.Id);
-            try { EncryptFile(src, dst); }
+            try { EncryptFile(src, dst, progress); }
             catch { try { File.Delete(dst); } catch { } throw; }
+            return en;
+        }
+
+        public void Commit(VaultEntry en)
+        {
             Entries.Add(en);
-            SaveIndex();
+            try { SaveIndex(); }
+            catch { Entries.Remove(en); throw; }
+        }
+
+        public void Discard(VaultEntry en) { try { File.Delete(BlobPath(en.Id)); } catch { } }
+
+        public VaultEntry AddFile(string src, string name)
+        {
+            var en = EncryptNew(src, name, null);
+            try { Commit(en); } catch { Discard(en); throw; }
             return en;
         }
 
@@ -271,49 +330,110 @@ namespace Un0yyVault
             Entries.Remove(en);
             SaveIndex();
             try { File.Delete(BlobPath(en.Id)); } catch { }
+            if (Favorites.Remove(en.Id)) { try { SaveMeta(); } catch { } }
+        }
+
+        public void Rename(VaultEntry en, string newName)
+        {
+            string old = en.Name;
+            en.Name = newName;
+            try { SaveIndex(); }
+            catch { en.Name = old; throw; }
+        }
+
+        /// Replaces the content of an entry (used when an opened file was edited and saved).
+        public void ReplaceContent(VaultEntry en, string src)
+        {
+            string newId = Guid.NewGuid().ToString("N");
+            string dst = BlobPath(newId);
+            try { EncryptFile(src, dst, null); }
+            catch { try { File.Delete(dst); } catch { } throw; }
+            string oldId = en.Id;
+            long oldSize = en.Size;
+            en.Id = newId;
+            en.Size = new FileInfo(src).Length;
+            try { SaveIndex(); }
+            catch { en.Id = oldId; en.Size = oldSize; try { File.Delete(dst); } catch { } throw; }
+            try { File.Delete(BlobPath(oldId)); } catch { }
+            if (Favorites.Remove(oldId)) { Favorites.Add(newId); try { SaveMeta(); } catch { } }
+        }
+
+        public bool IsFavorite(VaultEntry en) { return Favorites.Contains(en.Id); }
+
+        public void SetFavorite(VaultEntry en, bool fav)
+        {
+            bool changed = fav ? Favorites.Add(en.Id) : Favorites.Remove(en.Id);
+            if (changed) SaveMeta();
         }
 
         public void Export(VaultEntry en, string dst)
         {
-            try { DecryptFile(BlobPath(en.Id), dst); }
+            try
+            {
+                using (var outFs = new FileStream(dst, FileMode.Create, FileAccess.Write))
+                    DecryptTo(BlobPath(en.Id), outFs);
+            }
             catch { try { File.Delete(dst); } catch { } throw; }
         }
 
-        void EncryptFile(string src, string dst)
+        /// Decrypts into memory (for previews) - never touches the disk. Returns null if the file is larger than maxBytes.
+        public byte[] ReadAll(VaultEntry en, long maxBytes)
         {
+            if (en.Size > maxBytes) return null;
+            using (var ms = new MemoryStream((int)Math.Max(16, en.Size)))
+            {
+                DecryptTo(BlobPath(en.Id), ms);
+                return ms.ToArray();
+            }
+        }
+
+        void EncryptFile(string src, string dst, Action<long> progress)
+        {
+            byte[] e = ek, m = mk;
+            if (e == null || m == null) throw new InvalidOperationException("Der Tresor ist gesperrt.");
             using (var aes = Aes.Create())
             {
-                aes.Key = ek; aes.GenerateIV(); aes.Mode = CipherMode.CBC; aes.Padding = PaddingMode.PKCS7;
+                aes.Key = e; aes.GenerateIV(); aes.Mode = CipherMode.CBC; aes.Padding = PaddingMode.PKCS7;
                 using (var outFs = new FileStream(dst, FileMode.CreateNew, FileAccess.ReadWrite))
                 {
                     outFs.Write(aes.IV, 0, 16);
-                    using (var inFs = new FileStream(src, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    using (var inFs = new FileStream(src, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
                     using (var enc = aes.CreateEncryptor())
                     using (var cs = new CryptoStream(outFs, enc, CryptoStreamMode.Write, true))
                     {
-                        inFs.CopyTo(cs, 1 << 16);
+                        byte[] buf = new byte[1 << 18];
+                        long done = 0;
+                        int n;
+                        while ((n = inFs.Read(buf, 0, buf.Length)) > 0)
+                        {
+                            cs.Write(buf, 0, n);
+                            done += n;
+                            if (progress != null) progress(done);
+                        }
                         cs.FlushFinalBlock();
                     }
                     outFs.Flush();
                     outFs.Position = 0;
                     byte[] tag;
-                    using (var h = new HMACSHA256(mk)) tag = h.ComputeHash(outFs);
+                    using (var h = new HMACSHA256(m)) tag = h.ComputeHash(outFs);
                     outFs.Seek(0, SeekOrigin.End);
                     outFs.Write(tag, 0, 32);
                 }
             }
         }
 
-        void DecryptFile(string src, string dst)
+        void DecryptTo(string src, Stream output)
         {
+            byte[] e = ek, m = mk;
+            if (e == null || m == null) throw new InvalidOperationException("Der Tresor ist gesperrt.");
             using (var inFs = new FileStream(src, FileMode.Open, FileAccess.Read, FileShare.Read))
             {
                 long len = inFs.Length;
                 if (len < 16 + 16 + 32) throw new InvalidDataException("Die verschlüsselte Datei ist beschädigt.");
                 long bodyLen = len - 32;
-                byte[] buf = new byte[1 << 16];
+                byte[] buf = new byte[1 << 18];
                 byte[] tag;
-                using (var h = new HMACSHA256(mk))
+                using (var h = new HMACSHA256(m))
                 {
                     long rem = bodyLen;
                     while (rem > 0)
@@ -336,10 +456,9 @@ namespace Un0yyVault
                 ReadExact(inFs, iv, 16);
                 using (var aes = Aes.Create())
                 {
-                    aes.Key = ek; aes.IV = iv; aes.Mode = CipherMode.CBC; aes.Padding = PaddingMode.PKCS7;
-                    using (var outFs = new FileStream(dst, FileMode.Create, FileAccess.Write))
+                    aes.Key = e; aes.IV = iv; aes.Mode = CipherMode.CBC; aes.Padding = PaddingMode.PKCS7;
                     using (var dec = aes.CreateDecryptor())
-                    using (var cs = new CryptoStream(outFs, dec, CryptoStreamMode.Write))
+                    using (var cs = new CryptoStream(output, dec, CryptoStreamMode.Write, true))
                     {
                         long rem = bodyLen - 16;
                         while (rem > 0)
@@ -355,5 +474,4 @@ namespace Un0yyVault
             }
         }
     }
-
 }
